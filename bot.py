@@ -1,30 +1,38 @@
 import os
-import logging
-from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+import threading
+from flask import Flask
+from telegram.ext import ApplicationBuilder, MessageHandler, filters
 import google.generativeai as genai
 
-# Load keys from Pella's environment variables
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_KEY")
+# 1. Pella Heartbeat Server
+app = Flask('')
+@app.route('/')
+def home():
+    return "Bot is Online!"
 
-genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+def run_web():
+    # Pella usually looks for a web server to mark it as 'Starting' success
+    app.run(host='0.0.0.0', port=8080)
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Only respond to text messages
-    if not update.message.text: return
-    
-    user_text = update.message.text
+# 2. Gemini Bot Logic
+async def handle_msg(update, context):
+    genai.configure(api_key=os.getenv("GEMINI_KEY"))
+    model = genai.GenerativeModel('gemini-1.5-flash')
     try:
-        # Action "typing" shows the bot is working
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-        response = model.generate_content(user_text)
-        await update.message.reply_text(response.text, parse_mode='Markdown')
+        response = model.generate_content(update.message.text)
+        await update.message.reply_text(response.text)
     except Exception as e:
         print(f"Error: {e}")
 
+# 3. Execution
 if __name__ == '__main__':
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    app.run_polling()
+    # Start the web server in a background thread
+    t = threading.Thread(target=run_web)
+    t.start()
+    
+    # Start the Telegram Bot
+    print("--- Starting Telegram Bot ---")
+    token = os.getenv("TELEGRAM_TOKEN")
+    bot_app = ApplicationBuilder().token(token).build()
+    bot_app.add_handler(MessageHandler(filters.TEXT, handle_msg))
+    bot_app.run_polling()
