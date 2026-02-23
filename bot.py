@@ -327,22 +327,33 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==============================
 
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    try:
+        print("Starting bot...")
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("ai", ai_cmd))
-    app.add_handler(CommandHandler("leaderboard", leaderboard))
-    app.add_handler(CommandHandler("onquiz", onquiz))
-    app.add_handler(CommandHandler("offquiz", offquiz))
-    app.add_handler(CommandHandler("ping", ping))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("addvip", addvip))
-    app.add_handler(CommandHandler("removevip", removevip))
-    app.add_handler(MessageHandler(filters.POLL_ANSWER, handle_poll))
+        if not BOT_TOKEN:
+            raise ValueError("BOT_TOKEN is missing")
 
-    print("Bot running...")
-    app.run_polling()
+        app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("help", help_cmd))
+        app.add_handler(CommandHandler("ai", ai_cmd))
+        app.add_handler(CommandHandler("leaderboard", leaderboard))
+        app.add_handler(CommandHandler("onquiz", onquiz))
+        app.add_handler(CommandHandler("offquiz", offquiz))
+        app.add_handler(CommandHandler("ping", ping))
+        app.add_handler(CommandHandler("status", status))
+        app.add_handler(CommandHandler("addvip", addvip))
+        app.add_handler(CommandHandler("removevip", removevip))
+        app.add_handler(MessageHandler(filters.POLL_ANSWER, handle_poll))
+
+        print("Bot running...")
+        app.run_polling()
+
+    except Exception as e:
+        print("FATAL ERROR:", e)
+        raise
 
 if __name__ == "__main__":
     main()
+
