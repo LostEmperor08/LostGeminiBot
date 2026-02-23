@@ -1,151 +1,346 @@
-import os, json, time, asyncio, warnings, sys
-from datetime import datetime, timedelta
+import os
+import json
+import time
+from datetime import datetime
 
-# Official SDKs
-from openai import AsyncOpenAI
+from telegram import Update, Poll
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# AI SDKs
+from openai import OpenAI
+from google import genai
 from mistralai import Mistral
-import google.generativeai as genai
-from telegram import Update, Poll, constants
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, JobQueue, PollAnswerHandler
 
-warnings.filterwarnings("ignore", category=FutureWarning)
+# ==============================
+# ENV VARIABLES (Render Safe)
+# ==============================
 
-# --- CONFIG ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+
 OWNER_ID = 5917459734
 OWNER_USERNAME = "@lostemperor_08"
-BOT_TOKEN = "8245043931:AAF6pbRn30egtEEAffxUtDt1UbHxdv8pGoY"
-OPENAI_KEY = "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"
-GEMINI_KEY = "AIzaSyDJmngbKPCMd31cmuCv44oPy1aVwPgSyus"
-MISTRAL_KEY = "Ne0sG0ECaY3LTIpIXgYNrTwkotCkg2oL"
 
-# SDK Clients
-openai_client = AsyncOpenAI(api_key=OPENAI_KEY)
-mistral_client = Mistral(api_key=MISTRAL_KEY)
-genai.configure(api_key=GEMINI_KEY)
-gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+# Render persistent disk path
+DATA_FOLDER = "/opt/render/project/src/data"
+os.makedirs(DATA_FOLDER, exist_ok=True)
 
-# Persistence
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
-FILES = {k: f"{DATA_DIR}/{k}.json" for k in ["vips", "users", "timers", "leaderboard", "settings"]}
+USERS_FILE = f"{DATA_FOLDER}/users.json"
+VIP_FILE = f"{DATA_FOLDER}/vip.json"
+LEADERBOARD_FILE = f"{DATA_FOLDER}/leaderboard.json"
 
-def load_db(key, default):
-    if os.path.exists(FILES[key]):
-        with open(FILES[key], 'r') as f: return json.load(f)
-    return default
-
-def save_db(key, data):
-    with open(FILES[key], 'w') as f: json.dump(data, f, indent=4)
-
-vips = load_db("vips", [])
-user_data = load_db("users", {})
-timers = load_db("timers", {})
-leaderboard = load_db("leaderboard", {}) # {uid: {"score": 0, "name": ""}}
-settings = load_db("settings", {"quiz_active": False})
+COOLDOWN_SECONDS = 5
 START_TIME = time.time()
-user_cooldowns = {}
 
-# --- AI ENGINE HUB ---
-async def get_ai_response(prompt):
-    # 1. OpenAI
-    try:
-        res = await openai_client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], timeout=12)
-        return res.choices[0].message.content, "OpenAI"
-    except: pass
-    # 2. Gemini
-    try:
-        res = gemini_model.generate_content(prompt)
-        return res.text, "Gemini"
-    except: pass
-    # 3. Mistral
-    try:
-        res = await mistral_client.chat.complete_async(model="open-mistral-7b", messages=[{"role": "user", "content": prompt}])
-        return res.choices[0].message.content, "Mistral"
-    except: return "⚠️ All AI systems failed.", "None"
+# ==============================
+# AI CLIENTS
+# ==============================
 
-# --- CORE LOGIC ---
-def check_credits(uid):
-    uid_str = str(uid)
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+mistral_client = Mistral(api_key=MISTRAL_API_KEY)
+
+# ==============================
+# JSON UTILS
+# ==============================
+
+def load_json(file, default):
+    if not os.path.exists(file):
+        with open(file, "w") as f:
+            json.dump(default, f)
+    with open(file, "r") as f:
+        return json.load(f)
+
+def save_json(file, data):
+    with open(file, "w") as f:
+        json.dump(data, f, indent=4)
+
+# ==============================
+# AI ENGINE (Auto Fallback)
+# ==============================
+
+def ask_openai(prompt):
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.choices[0].message.content
+    except Exception:
+        return None
+
+def ask_gemini(prompt):
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=prompt,
+        )
+        return response.text
+    except Exception:
+        return None
+
+def ask_mistral(prompt):
+    try:
+        response = mistral_client.chat.complete(
+            model="mistral-small-latest",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.choices[0].message.content
+    except Exception:
+        return None
+
+def ask_ai(prompt):
+    for provider in [ask_openai, ask_gemini, ask_mistral]:
+        reply = provider(prompt)
+        if reply:
+            return reply
+    return "⚠ All AI providers are temporarily unavailable."
+
+# ==============================
+# CREDIT SYSTEM
+# ==============================
+
+def reset_daily():
+    users = load_json(USERS_FILE, {})
     today = datetime.now().strftime("%Y-%m-%d")
-    if uid_str not in user_data or user_data[uid_str].get("reset") != today:
-        user_data[uid_str] = {"daily": 0, "bonus": user_data.get(uid_str, {}).get("bonus", 0), "reset": today}
-    return user_data[uid_str]
 
-# --- HANDLERS ---
+    for uid in users:
+        if users[uid]["last_reset"] != today:
+            users[uid]["credits"] = 2
+            users[uid]["bonus"] = 0
+            users[uid]["last_reset"] = today
+
+    save_json(USERS_FILE, users)
+
+def get_user(uid):
+    users = load_json(USERS_FILE, {})
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if str(uid) not in users:
+        users[str(uid)] = {
+            "credits": 2,
+            "bonus": 0,
+            "last_reset": today,
+            "cooldown": 0
+        }
+        save_json(USERS_FILE, users)
+
+    return users[str(uid)]
+
+def update_user(uid, data):
+    users = load_json(USERS_FILE, {})
+    users[str(uid)] = data
+    save_json(USERS_FILE, users)
+
+def is_vip(uid):
+    vip = load_json(VIP_FILE, [])
+    return str(uid) in vip
+
+# ==============================
+# COMMANDS
+# ==============================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"📚 Study Bot Active\nOwner: {OWNER_USERNAME}\nUse /help"
+    )
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        """📘 Commands
+
+/ai [question]
+/leaderboard
+/onquiz
+/offquiz
+/ping
+/help
+
+Owner:
+/addvip user_id
+/removevip user_id
+/status"""
+    )
+
+# ==============================
+# AI COMMAND
+# ==============================
+
 async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid in user_cooldowns and time.time() - user_cooldowns[uid] < 5:
-        return await update.message.reply_text("⏳ Cooldown: 5s")
-    
-    u = check_credits(uid)
-    limit = 25 if uid in vips else 2
-    if uid != OWNER_ID and u["daily"] >= limit and u["bonus"] <= 0:
-        return await update.message.reply_text("🪫 No credits! Correct quiz answers give +1 bonus.")
+    reset_daily()
+    user = get_user(uid)
+
+    now = time.time()
+    if now - user["cooldown"] < COOLDOWN_SECONDS:
+        await update.message.reply_text("⏳ Wait 5 seconds.")
+        return
+
+    if uid != OWNER_ID:
+        total = user["credits"] + user["bonus"]
+        if total <= 0:
+            await update.message.reply_text("❌ No credits left.")
+            return
+
+        if user["bonus"] > 0:
+            user["bonus"] -= 1
+        else:
+            user["credits"] -= 1
+
+    user["cooldown"] = now
+    update_user(uid, user)
 
     query = " ".join(context.args)
-    if not query: return await update.message.reply_text("❓ Usage: /ai [topic]")
-    
-    m = await update.message.reply_text("🔎 **Consulting AI Engines...**", parse_mode="Markdown")
-    res, engine = await get_ai_response(query)
-    user_cooldowns[uid] = time.time()
-    
-    if uid != OWNER_ID:
-        if u["daily"] < limit: u["daily"] += 1
-        else: u["bonus"] -= 1
-        save_db("users", user_data)
+    if not query:
+        await update.message.reply_text("Provide a question.")
+        return
 
-    rem = "∞" if uid == OWNER_ID else (limit - u["daily"] + u["bonus"])
-    safe_res = res.replace("<", "&lt;").replace(">", "&gt;")
-    await m.edit_text(f"🎓 <b>Tutor ({engine}):</b>\n\n{safe_res}\n\n🔋 <b>Credits Left:</b> {rem}", parse_mode="HTML")
+    reply = ask_ai(query)
+    remaining = user["credits"] + user["bonus"]
 
-# --- QUIZ SYSTEM ---
-async def hourly_quiz(context: ContextTypes.DEFAULT_TYPE):
-    if not settings["quiz_active"]: return
-    subj = ["Physics", "Chemistry", "Mathematics", "Biology"][int(time.time()/3600)%4]
-    prompt = f"Create 1 hard MCQ for {subj}. Format: Question|Opt0|Opt1|Opt2|Opt3|CorrectIdx(0-3). No other text."
-    res, _ = await get_ai_response(prompt)
-    try:
-        p = res.split("|")
-        poll = await context.bot.send_poll(context.job.chat_id, f"📚 {subj} Quiz: {p[0]}", p[1:5], type=Poll.QUIZ, correct_option_id=int(p[5]), is_anonymous=False)
-        context.bot_data[poll.poll.id] = int(p[5]) # Store correct ID
-    except: pass
+    await update.message.reply_text(
+        f"{reply}\n\n💳 Credits left: {remaining}"
+    )
 
-async def poll_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ==============================
+# QUIZ SYSTEM
+# ==============================
+
+QUIZ_SUBJECTS = ["Physics", "Chemistry", "Mathematics", "Biology"]
+quiz_active = False
+quiz_index = 0
+
+async def send_quiz(context: ContextTypes.DEFAULT_TYPE):
+    global quiz_index
+    if not quiz_active:
+        return
+
+    subject = QUIZ_SUBJECTS[quiz_index % 4]
+    quiz_index += 1
+
+    question = f"{subject}: 5 × 3 = ?"
+    options = ["10", "15", "20", "25"]
+
+    message = await context.bot.send_poll(
+        chat_id=context.job.chat_id,
+        question=question,
+        options=options,
+        type=Poll.QUIZ,
+        correct_option_id=1,
+        is_anonymous=False,
+    )
+
+    context.bot_data[message.poll.id] = {"correct": 1}
+
+async def onquiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global quiz_active
+    quiz_active = True
+    chat_id = update.effective_chat.id
+    context.job_queue.run_repeating(send_quiz, 3600, first=5, chat_id=chat_id)
+    await update.message.reply_text("✅ Hourly quiz started.")
+
+async def offquiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global quiz_active
+    quiz_active = False
+    context.job_queue.stop()
+    await update.message.reply_text("❌ Quiz stopped.")
+
+async def handle_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = update.poll_answer
-    uid = str(answer.user.id)
-    correct_id = context.bot_data.get(answer.poll_id)
-    
-    if correct_id is not None and answer.option_ids[0] == correct_id:
-        # Reward
-        if uid not in leaderboard: leaderboard[uid] = {"score": 0, "n": answer.user.first_name}
-        leaderboard[uid]["score"] += 1
-        u = check_credits(answer.user.id)
-        u["bonus"] += 1
-        save_db("leaderboard", leaderboard); save_db("users", user_data)
+    poll_id = answer.poll_id
 
-# --- TRACKING ---
-async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        dt, name = context.args[0], " ".join(context.args[1:]).lower()
-        datetime.strptime(dt, "%d-%m-%Y")
-        timers[name] = dt; save_db("timers", timers)
-        await update.message.reply_text(f"✅ Timer set: <b>{name.upper()}</b>", parse_mode="HTML")
-    except: await update.message.reply_text("❌ Use: /timer DD-MM-YYYY Name")
+    if poll_id in context.bot_data:
+        correct = context.bot_data[poll_id]["correct"]
+        if answer.option_ids[0] == correct:
+            uid = answer.user.id
+            user = get_user(uid)
+            user["bonus"] += 1
+            update_user(uid, user)
 
-async def get_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = " ".join(context.args).lower()
-    if name in timers:
-        days = (datetime.strptime(timers[name], "%d-%m-%Y") - datetime.now()).days + 1
-        await update.message.reply_text(f"⏳ <b>{name.upper()}</b>: {max(0, days)} days left", parse_mode="HTML")
-    else: await update.message.reply_text("❌ Not found.")
+            board = load_json(LEADERBOARD_FILE, {})
+            board[str(uid)] = board.get(str(uid), 0) + 1
+            save_json(LEADERBOARD_FILE, board)
 
-# --- MAIN ---
-if __name__ == '__main__':
+# ==============================
+# LEADERBOARD
+# ==============================
+
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    board = load_json(LEADERBOARD_FILE, {})
+    sorted_board = sorted(board.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    text = "🏆 Leaderboard\n\n"
+    for i, (uid, score) in enumerate(sorted_board, 1):
+        text += f"{i}. {uid} - {score}\n"
+
+    await update.message.reply_text(text)
+
+# ==============================
+# PING & STATUS
+# ==============================
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uptime = int(time.time() - START_TIME)
+    await update.message.reply_text(f"🏓 Uptime: {uptime} sec")
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    await update.message.reply_text("🟢 Bot running normally.")
+
+# ==============================
+# VIP
+# ==============================
+
+async def addvip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    uid = context.args[0]
+    vip = load_json(VIP_FILE, [])
+    if uid not in vip:
+        vip.append(uid)
+        save_json(VIP_FILE, vip)
+    await update.message.reply_text("VIP added.")
+
+async def removevip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    uid = context.args[0]
+    vip = load_json(VIP_FILE, [])
+    if uid in vip:
+        vip.remove(uid)
+        save_json(VIP_FILE, vip)
+    await update.message.reply_text("VIP removed.")
+
+# ==============================
+# MAIN
+# ==============================
+
+def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("ai", ai_cmd))
-    app.add_handler(CommandHandler("timer", set_timer))
-    app.add_handler(CommandHandler("gettime", get_time))
-    app.add_handler(CommandHandler("onquiz", lambda u,c: (settings.update({"quiz_active":True}), save_db("settings", settings), c.job_queue.run_repeating(hourly_quiz, 3600, chat_id=u.effective_chat.id))))
-    app.add_handler(PollAnswerHandler(poll_answer_handler))
-    print("🚀 Master Bot Started")
+    app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CommandHandler("onquiz", onquiz))
+    app.add_handler(CommandHandler("offquiz", offquiz))
+    app.add_handler(CommandHandler("ping", ping))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("addvip", addvip))
+    app.add_handler(CommandHandler("removevip", removevip))
+    app.add_handler(MessageHandler(filters.POLL_ANSWER, handle_poll))
+
+    print("Bot running...")
     app.run_polling()
+
+if __name__ == "__main__":
+    main()
